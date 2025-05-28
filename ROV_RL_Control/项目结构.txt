@@ -1,0 +1,26 @@
+rov_rl_control/
+├─ README.md
+├─ docs/
+├─ envs/
+│  ├─ rov_dyn_env.py
+│  └─ vector/
+│      └─ make_vec_env.py
+├─ models/
+│  ├─ policy_net.py
+│  └─ lstm_dyn/
+│      ├─ loader.py
+│      └─ model_hybrid_full.pt
+├─ trainer/
+│  ├─ configs/
+│  │   └─ generate_config.py
+│  ├─ train_ppo.py
+│  └─ train_sac.py
+├─ utils/
+│  └─ math_util.py
+├─ scripts/
+│  ├─ run_train.sh
+│  └─ run_eval.sh
+├─ tests/
+│  └─ test_env.py
+├─ data/
+└─ requirements-train.txt
