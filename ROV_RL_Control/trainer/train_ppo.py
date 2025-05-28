@@ -9,7 +9,7 @@ import yaml
 import torch
 import argparse
 from datetime import datetime
-from envs.rov_dyn_env import ROVDynEnv
+from ..envs.rov_dyn_env import ROVDynEnv
 from gymnasium.vector import AsyncVectorEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecMonitor, VecNormalize

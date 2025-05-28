@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 import torch
-from envs.rov_dyn_env import ROVDynEnv
+from ..envs.rov_dyn_env import ROVDynEnv
 
 
 def test_env_initialization_and_shapes():

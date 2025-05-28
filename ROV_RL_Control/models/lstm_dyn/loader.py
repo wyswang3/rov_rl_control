@@ -28,10 +28,10 @@ def load_dynamics(device: str = "cuda"):
     model.eval()
 
     # Prepare hidden-state initializer
-    def init_hidden(batch_size: int = 1):
+    def init_hidden(batch: int = 1):
         # Prefer existing method if defined
         if hasattr(model, 'init_hidden'):
-            return model.init_hidden(batch_size)
+            return model.init_hidden(batch)
         # Fallback: look for LSTM attributes
         # Attempt to find any nn.LSTM in model
         for module in model.modules():
@@ -39,7 +39,7 @@ def load_dynamics(device: str = "cuda"):
                 num_layers = module.num_layers
                 hidden_size = module.hidden_size
                 # return tuple of (h0, c0)
-                h0 = torch.zeros(num_layers, batch_size, hidden_size, device=device)
+                h0 = torch.zeros(num_layers, batch, hidden_size, device=device)
                 c0 = torch.zeros_like(h0)
                 return (h0, c0)
         # If no LSTM found, return None or empty tuple

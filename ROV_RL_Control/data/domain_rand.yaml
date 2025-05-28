@@ -1,0 +1,8 @@
+mass_scale:
+- 0.9
+- 1.1
+drag_scale:
+- 0.8
+- 1.2
+accel_noise_std: 0.02
+gyro_noise_std: 0.01

@@ -24,3 +24,8 @@ rov_rl_control/
 │  └─ test_env.py
 ├─ data/
 └─ requirements-train.txt
+
+git add .
+git commit -m "简要说明本次改动"
+git push
+pip freeze > requirements-train.txt

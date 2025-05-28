@@ -7,7 +7,7 @@ import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 from stable_baselines3.common.vec_env import VecMonitor, VecNormalize
 
-from envs.rov_dyn_env import ROVDynEnv
+from ..rov_dyn_env import ROVDynEnv
 
 __all__ = ["make_vec_env"]
 
