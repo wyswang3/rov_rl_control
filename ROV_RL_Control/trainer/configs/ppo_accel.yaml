@@ -2,9 +2,9 @@ env:
   dt: 0.02
   max_power: 60.0
 reward:
-  pos: 1.0
-  ori: 0.3
-  energy: 0.01
+  w_err: 1.0
+  w_jerk: 0.5
+  w_eng: 0.01
 algo: PPO
 n_envs: 1
 total_steps: 200000

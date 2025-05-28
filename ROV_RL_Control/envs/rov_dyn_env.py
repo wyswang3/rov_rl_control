@@ -1,3 +1,17 @@
+#!/usr/bin/env python3
+# envs/rov_dyn_env.py
+
+"""
+Gym 环境：基于 HybridDynamicsModel 的加速度控制任务
+Observation (15-dim):
+  [eul(3), ang_vel(3), last_acc(6), last_jerk(3)]
+Action (8-dim): 推力功率
+Reward:
+  - w_err * ||accel||^2
+  - w_jerk * ||jerk||^2
+  - w_eng * sum(power^2)
+"""
+
 import gymnasium as gym
 import numpy as np
 import torch
@@ -6,53 +20,76 @@ from utils.math_util import quat_mul, quat_from_omega
 from models.lstm_dyn.loader import load_dynamics
 
 class ROVDynEnv(gym.Env):
-    """
-    Gym 环境：基于 HybridDynamicsModel 的时序输入（window_size, 14）
-    观测 (18):
-      [pos(3), vel(3), eul(3), ang_vel(3), last_acc(6)]
-    动作 (8): 推力功率
-    """
+    metadata = {"render_modes": []}
+
     def __init__(self,
                  dt: float = 0.02,
                  max_power: float = 80.0,
                  device: str = "cpu",
-                 window_size: int = 9):
+                 window_size: int = 9,
+                 w_err: float = 1.0,
+                 w_jerk: float = 0.5,
+                 w_eng: float = 0.01):
         super().__init__()
         self.dt = dt
         self.max_power = max_power
         self.device = device
         self.window = window_size
 
+        # Loss weights
+        self.w_err = w_err
+        self.w_jerk = w_jerk
+        self.w_eng = w_eng
+
         # Load HybridDynamicsModel
         self.model, _ = load_dynamics(device)
         self.model.eval()
 
-        # Spaces
+        # Action and observation spaces
         self.action_space = gym.spaces.Box(0.0, max_power, (8,), np.float32)
-        high = np.inf * np.ones(18, np.float32)
-        self.observation_space = gym.spaces.Box(-high, high, dtype=np.float32)
+        # Observations: [eul(3), ang_vel(3), last_acc(6), last_jerk(3)] = 15-dim
+        obs_high = np.inf * np.ones(15, dtype=np.float32)
+        self.observation_space = gym.spaces.Box(-obs_high, obs_high, dtype=np.float32)
 
-        # State & history buffers
-        self.state = np.zeros(12, dtype=np.float32)
-        self.last_acc = np.zeros(6, dtype=np.float32)
-        self.pw_buf  = deque(maxlen=window_size)  # each entry: 8-dim
-        self.imu_buf = deque(maxlen=window_size)  # each entry: 6-dim
+        # State buffers
+        self.eul_buf   = deque(maxlen=1)  # store last euler
+        self.angv_buf  = deque(maxlen=1)  # store last angular velocity
+        self.acc_buf   = deque(maxlen=1)  # last acceleration
+        self.jerk_buf  = deque(maxlen=1)  # last jerk
+
+        # Initialize zero-history
+        zero_eul = np.zeros(3, dtype=np.float32)
+        zero_ang = np.zeros(3, dtype=np.float32)
+        zero_acc = np.zeros(6, dtype=np.float32)
+        zero_jerk= np.zeros(3, dtype=np.float32)
+        self.eul_buf.append(zero_eul)
+        self.angv_buf.append(zero_ang)
+        self.acc_buf.append(zero_acc)
+        self.jerk_buf.append(zero_jerk)
+
+        # Internal LSTM history
+        self.pw_buf  = deque(maxlen=window_size)
+        self.imu_buf = deque(maxlen=window_size)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         rng = self.np_random
 
-        # Reset kinematics
-        self.state.fill(0.0)
-        self.state[:3] = rng.uniform(-1.0, 1.0, size=3)
-        self.state[8]  = rng.uniform(0, 2*np.pi)
-        self.last_acc.fill(0.0)
+        # Reset orientation and angular velocity
+        init_eul = np.array([0.0, 0.0, rng.uniform(0, 2*np.pi)], dtype=np.float32)
+        init_ang = np.zeros(3, dtype=np.float32)
+        zero_acc = np.zeros(6, dtype=np.float32)
+        zero_jrk = np.zeros(3, dtype=np.float32)
 
-        # Reset buffers with zeros
+        self.eul_buf.clear(); self.eul_buf.append(init_eul)
+        self.angv_buf.clear(); self.angv_buf.append(init_ang)
+        self.acc_buf.clear(); self.acc_buf.append(zero_acc)
+        self.jerk_buf.clear(); self.jerk_buf.append(zero_jrk)
+
+        # Reset LSTM buffers
         zero_pw  = np.zeros(8, dtype=np.float32)
         zero_imu = np.zeros(6, dtype=np.float32)
-        self.pw_buf.clear()
-        self.imu_buf.clear()
+        self.pw_buf.clear(); self.imu_buf.clear()
         for _ in range(self.window):
             self.pw_buf.append(zero_pw)
             self.imu_buf.append(zero_imu)
@@ -60,50 +97,50 @@ class ROVDynEnv(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action):
-        # 1) Clip action & update power history
+        """
+        执行动作一步：
+        - action: 推力功率 (8,)
+        - 返回: (obs, reward, done, False, {})
+        """
+        # 1) 限幅 & 更新推力历史
         act = np.clip(action, 0.0, self.max_power).astype(np.float32)
         self.pw_buf.append(act)
 
-        # 2) Build LSTM input sequences
-        pw_seq  = np.stack(self.pw_buf,  axis=0)  # (window,8)
-        imu_seq = np.stack(self.imu_buf, axis=0)  # (window,6)
-        # shape to (1,window,*) and send to device
-        pw_t  = torch.from_numpy(pw_seq[None]).to(self.device)
-        imu_t = torch.from_numpy(imu_seq[None]).to(self.device)
+        # 2) 构造 LSTM 输入张量 (1, window, *)
+        pw_seq = torch.tensor(np.stack(self.pw_buf)[None], dtype=torch.float32, device=self.device)
+        imu_seq = torch.tensor(np.stack(self.imu_buf)[None], dtype=torch.float32, device=self.device)
 
-        # 3) Predict accel via HybridDynamicsModel
+        # 3) 模型推理：预测加速度 (1,6) → (6,)
         with torch.no_grad():
-            accel_t = self.model(pw_t, imu_t)       # (1,6)
-        accel = accel_t.squeeze(0).cpu().numpy().astype(np.float32)
+            accel_t = self.model(pw_seq, imu_seq)
+        accel = accel_t[0].cpu().numpy().astype(np.float32)
 
-        # 4) Update accel history
-        self.last_acc = accel
+        # 4) 重力去除（假设 Z 轴指向下）
+        accel[2] -= 9.81
+
+        # 5) 计算 jerk（角加速度部分）
+        prev_acc = self.acc_buf[-1]
+        jerk = accel[3:] - prev_acc[3:]
+
+        # 6) 计算奖励：加速度误差、jerk、能耗
+        r_err = -self.w_err * np.dot(accel, accel)
+        r_jerk = -self.w_jerk * np.dot(jerk, jerk)
+        r_eng = -self.w_eng * np.dot(act, act)
+        reward = float(r_err + r_jerk + r_eng)
+
+        # 7) 更新历史缓冲
         self.imu_buf.append(accel)
+        self.acc_buf.append(accel)
+        self.jerk_buf.append(jerk)
 
-        # 5) Kinematics integration
-        p, v, eul, omg = np.split(self.state, [3,6,9])
-        lin_acc = accel[:3]; ang_acc = accel[3:]
-        v   += lin_acc * self.dt
-        p   += v       * self.dt
-        omg += ang_acc * self.dt
+        # 8) 环境不终止
+        done = False
 
-        # Orientation update
-        dq   = quat_from_omega(omg, self.dt)
-        q    = quat_from_omega(eul, 0.0)
-        q    = quat_mul(q, dq)
-        # Euler angles
-        yaw   = np.arctan2(2*(q[3]*q[2]+q[0]*q[1]), 1-2*(q[1]**2+q[2]**2))
-        roll  = np.arctan2(2*(q[3]*q[0]+q[1]*q[2]), 1-2*(q[0]**2+q[1]**2))
-        pitch = np.arcsin(2*(q[3]*q[1]-q[2]*q[0]))
-        eul   = np.array([roll, pitch, yaw], dtype=np.float32)
-
-        self.state = np.hstack([p, v, eul, omg])
-
-        # 6) Reward & done
-        reward = -np.linalg.norm(p)
-        done   = False
-        return self._get_obs(), float(reward), done, False, {}
+        return self._get_obs(), reward, done, False, {}
 
     def _get_obs(self):
-        # concat state + last_acc
-        return np.hstack([self.state, self.last_acc]).astype(np.float32)
+        eul   = self.eul_buf[-1]
+        angv  = self.angv_buf[-1]
+        acc   = self.acc_buf[-1]
+        jerk  = self.jerk_buf[-1]
+        return np.concatenate([eul, angv, acc, jerk]).astype(np.float32)

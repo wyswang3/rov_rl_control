@@ -26,6 +26,10 @@ rov_rl_control/
 └─ requirements-train.txt
 
 git add .
-git commit -m "简要说明本次改动"
+git commit -m "cpu运行测试通过"
 git push
 pip freeze > requirements-train.txt
+# 你此时在 main 上做了修改，甚至还没 commit
+git checkout -b accel-ctrl   # 会自动把当前修改带到新分支
+git add .
+git commit -m "feat: ... "
