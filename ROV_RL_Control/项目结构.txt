@@ -31,8 +31,9 @@ git push
 pip freeze > requirements-train.txt
 # 你此时在 main 上做了修改，甚至还没 commit
 git checkout -b accel-ctrl   # 会自动把当前修改带到新分支
+git checkout  accel-ctrl
 git add .
-git commit -m "feat: ... "
+git commit -m "调整了状态空间 "
 git push -u origin accel-ctrl
 
-python -m trainer.train_ppo -c trainer/configs/ppo_accel.yaml
+python -m trainer.train_ppo -c trainer/configs/ppo_accel_tuned.yaml

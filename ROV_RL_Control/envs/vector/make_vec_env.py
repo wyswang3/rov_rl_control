@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
+# envs/vector/make_vec_env.py
+
 """
-envs/vector/make_vec_env.py
+Factory for creating a vectorized ROVDynEnv, wrapped with VecMonitor and VecNormalize,
+and configured to use GPU during model inference when available.
 
-Factory for creating a vectorized ROV dynamics environment. Uses SB3’s
-DummyVecEnv or SubprocVecEnv so that VecMonitor/VecNormalize can work properly.
+从 cfg 中读取：
+  - cfg["env"]       → ROVDynEnv 的基本参数（dt, max_power, window_size, accel_filter_alpha…）
+  - cfg["reward"]    → ROVDynEnv 的奖励权重（k_pos, k_att, k_vel, k_jerk, k_eng, k_succ, pos_tol…）
+  - cfg["sampling"]  → 并行环境数 n_envs 及 batch_size
+  - cfg["train"]     → 随机种子 seed, total_timesteps 等（若需）
+  - cfg["ppo"]       → PPO 算法的超参数（若需）
 
-Usage:
-    vec_env = make_vec_env(
-        cfg=cfg_dict,
-        device="cpu",
-        n_envs=4,
-        asynchronous=False
-    )
+最终返回 DummyVecEnv（或 SubprocVecEnv）→ VecMonitor → VecNormalize，
+其中 ROVDynEnv 内部会根据传入的 `device` 参数在 GPU/CPU 上加载网络模型。
 """
 
 import sys
-from stable_baselines3.common.vec_env import (
-    DummyVecEnv,
-    SubprocVecEnv,
-    VecMonitor,
-    VecNormalize,
-)
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor, VecNormalize
 from envs.rov_dyn_env import ROVDynEnv
 
 
@@ -31,55 +28,70 @@ def make_vec_env(
     cfg: dict,
     device: str,
     n_envs: int,
-    asynchronous: bool = False
+    asynchronous: bool = None
 ):
     """
-    Create a vectorized ROVDynEnv wrapped with VecMonitor and VecNormalize.
+    创建一个向量化的 ROVDynEnv，并依次套上 VecMonitor, VecNormalize。
 
-    Args:
-        cfg (dict): Full configuration dictionary loaded from YAML. Expects keys:
-            - "env": containing dt, max_power, window_size, accel_filter_alpha, etc.
-            - "reward": containing w_err, w_jerk, w_eng, etc.
-        device (str): "cpu" or "cuda"
-        n_envs (int): Number of parallel environments to create
-        asynchronous (bool): If True, use SubprocVecEnv (multiple processes).
-                             Otherwise (or on Windows, or n_envs == 1), use DummyVecEnv.
+    参数:
+      - cfg          : 从 YAML 读取的完整配置 dict
+      - device       : "cpu" 或 "cuda"，传递给 ROVDynEnv 以决定模型加载的位置
+      - n_envs       : 并行环境数量
+      - asynchronous : 是否使用 SubprocVecEnv；若为 None，则在 Linux+GPU 环境下自动启用 SubprocVecEnv，
+                      否则强制使用 DummyVecEnv。
 
-    Returns:
-        VecNormalize: A vectorized environment (VecMonitor + VecNormalize).
+    返回:
+      - 一个被 VecMonitor + VecNormalize 包装好的 SB3 VectorEnv
     """
-    # 1) Extract environment-specific parameters from cfg
-    env_cfg = cfg.get("env", {})
+
+    # ── 1) 从 cfg 中提取 ROVDynEnv 构造时所需的参数 ──
+    env_cfg    = cfg.get("env", {})
     reward_cfg = cfg.get("reward", {})
 
+    # 将 cfg["env"] 中的 key/values 对应到 ROVDynEnv 初始化参数
+    # 注意：我们要确保传了 device，让模型在 GPU 上运行
     env_kwargs = {
-        "dt":                 env_cfg.get("dt", 0.02),
-        "max_power":          env_cfg.get("max_power", 80.0),
-        "window_size":        env_cfg.get("window_size", 9),
-        "accel_filter_alpha": env_cfg.get("accel_filter_alpha", 0.5),
-        "w_err":              reward_cfg.get("w_err", 1.0),
-        "w_jerk":             reward_cfg.get("w_jerk", 0.5),
-        "w_eng":              reward_cfg.get("w_eng", 0.01),
+        "dt":                  env_cfg.get("dt", 0.02),
+        "max_power":           env_cfg.get("max_power", 60.0),
+        "device":              device,
+        "window_size":         env_cfg.get("window_size", 9),
+        "accel_filter_alpha":  env_cfg.get("accel_filter_alpha", 0.5),
+        # 奖励权重
+        "k_pos":               reward_cfg.get("k_pos", 1.0),
+        "k_att":               reward_cfg.get("k_att", 0.5),
+        "k_vel":               reward_cfg.get("k_vel", 0.1),
+        "k_jerk":              reward_cfg.get("k_jerk", 0.01),
+        "k_eng":               reward_cfg.get("k_eng", 0.001),
+        "k_succ":              reward_cfg.get("k_succ", 5.0),
+        "pos_tol":             reward_cfg.get("pos_tol", 0.1),
     }
 
-    # 2) Define a factory for each sub‐environment
-    def make_single_env(seed: int):
+    # ── 2) 定义“工厂函数”——每个子环境的初始化：──
+    def make_single_env(rank: int):
         def _init():
-            env = ROVDynEnv(device=device, **env_kwargs)
-            env.reset(seed=seed)
+            env = ROVDynEnv(**env_kwargs)
+            # 给每个子环境一个不同的 seed（rank），保持可复现性
+            env.reset(seed=rank)
             return env
         return _init
 
     env_fns = [make_single_env(i) for i in range(n_envs)]
 
-    # 3) Choose DummyVecEnv or SubprocVecEnv
+    # ── 3) 选择使用 DummyVecEnv 还是 SubprocVecEnv ──
     is_windows = sys.platform.startswith("win")
-    if is_windows or not asynchronous or n_envs == 1:
-        vec = DummyVecEnv(env_fns)
+    # 如果未指定 asynchronous，就在 Linux+GPU 下默认启用 SubprocVecEnv；否则按用户要求
+    if asynchronous is None:
+        use_subproc = (not is_windows) and (device == "cuda") and (n_envs > 1)
     else:
-        vec = SubprocVecEnv(env_fns)
+        use_subproc = asynchronous
 
-    # 4) Wrap with VecMonitor and VecNormalize
+    if use_subproc:
+        vec = SubprocVecEnv(env_fns)
+    else:
+        vec = DummyVecEnv(env_fns)
+
+    # ── 4) 再套上 VecMonitor 和 VecNormalize ──
+    # VecMonitor 用于记录 episode reward/length；VecNormalize 会对 obs 做归一化
     vec = VecMonitor(vec)
     vec = VecNormalize(vec, norm_obs=True, norm_reward=False)
 
