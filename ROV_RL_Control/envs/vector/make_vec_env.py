@@ -1,56 +1,86 @@
-# envs/vector/make_vec_env.py
+#!/usr/bin/env python3
 """
-Factory for creating a vectorized ROV dynamics environment.
-Supports both async and sync vectorization, plus monitoring and normalization.
-"""
-import gymnasium as gym
-from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
-from stable_baselines3.common.vec_env import VecMonitor, VecNormalize
+envs/vector/make_vec_env.py
 
-from ..rov_dyn_env import ROVDynEnv
+Factory for creating a vectorized ROV dynamics environment. Uses SB3’s
+DummyVecEnv or SubprocVecEnv so that VecMonitor/VecNormalize can work properly.
+
+Usage:
+    vec_env = make_vec_env(
+        cfg=cfg_dict,
+        device="cpu",
+        n_envs=4,
+        asynchronous=False
+    )
+"""
+
+import sys
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecMonitor,
+    VecNormalize,
+)
+from envs.rov_dyn_env import ROVDynEnv
+
 
 __all__ = ["make_vec_env"]
 
+
 def make_vec_env(
-    cfg_env: dict,
+    cfg: dict,
     device: str,
     n_envs: int,
-    asynchronous: bool = True
-) -> gym.vector.VectorEnv:
+    asynchronous: bool = False
+):
     """
-    Create a vectorized ROV dynamical environment.
+    Create a vectorized ROVDynEnv wrapped with VecMonitor and VecNormalize.
 
     Args:
-        cfg_env (dict): environment parameters, e.g. {'dt':0.02,'max_power':480.0}
-        device (str): device for LSTM model ('cuda' or 'cpu')
-        n_envs (int): number of parallel environments
-        asynchronous (bool): use AsyncVectorEnv if True, else SyncVectorEnv
+        cfg (dict): Full configuration dictionary loaded from YAML. Expects keys:
+            - "env": containing dt, max_power, window_size, accel_filter_alpha, etc.
+            - "reward": containing w_err, w_jerk, w_eng, etc.
+        device (str): "cpu" or "cuda"
+        n_envs (int): Number of parallel environments to create
+        asynchronous (bool): If True, use SubprocVecEnv (multiple processes).
+                             Otherwise (or on Windows, or n_envs == 1), use DummyVecEnv.
 
     Returns:
-        VectorEnv: wrapped with VecMonitor and VecNormalize
+        VecNormalize: A vectorized environment (VecMonitor + VecNormalize).
     """
-    # Closure to capture rank for seeding
-    def make_fn(rank: int):
+    # 1) Extract environment-specific parameters from cfg
+    env_cfg = cfg.get("env", {})
+    reward_cfg = cfg.get("reward", {})
+
+    env_kwargs = {
+        "dt":                 env_cfg.get("dt", 0.02),
+        "max_power":          env_cfg.get("max_power", 80.0),
+        "window_size":        env_cfg.get("window_size", 9),
+        "accel_filter_alpha": env_cfg.get("accel_filter_alpha", 0.5),
+        "w_err":              reward_cfg.get("w_err", 1.0),
+        "w_jerk":             reward_cfg.get("w_jerk", 0.5),
+        "w_eng":              reward_cfg.get("w_eng", 0.01),
+    }
+
+    # 2) Define a factory for each sub‐environment
+    def make_single_env(seed: int):
         def _init():
-            env = ROVDynEnv(
-                dt=cfg_env['dt'],
-                max_power=cfg_env['max_power'],
-                device=device
-            )
-            env.reset(seed=rank)
+            env = ROVDynEnv(device=device, **env_kwargs)
+            env.reset(seed=seed)
             return env
         return _init
 
-    env_fns = [make_fn(i) for i in range(n_envs)]
+    env_fns = [make_single_env(i) for i in range(n_envs)]
 
-    # Choose vectorization style
-    if asynchronous:
-        vec = AsyncVectorEnv(env_fns)
+    # 3) Choose DummyVecEnv or SubprocVecEnv
+    is_windows = sys.platform.startswith("win")
+    if is_windows or not asynchronous or n_envs == 1:
+        vec = DummyVecEnv(env_fns)
     else:
-        vec = SyncVectorEnv(env_fns)
+        vec = SubprocVecEnv(env_fns)
 
-    # Monitor episode rewards and lengths
+    # 4) Wrap with VecMonitor and VecNormalize
     vec = VecMonitor(vec)
-    # Normalize observations (mean=0, var=1), leave rewards unnormalized
     vec = VecNormalize(vec, norm_obs=True, norm_reward=False)
+
     return vec

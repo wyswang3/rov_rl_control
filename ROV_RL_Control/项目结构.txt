@@ -33,3 +33,6 @@ pip freeze > requirements-train.txt
 git checkout -b accel-ctrl   # 会自动把当前修改带到新分支
 git add .
 git commit -m "feat: ... "
+git push -u origin accel-ctrl
+
+python -m trainer.train_ppo -c trainer/configs/ppo_accel.yaml

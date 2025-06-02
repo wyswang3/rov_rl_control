@@ -1,0 +1,18 @@
+env:
+  dt: 0.02
+  max_power: 60.0
+reward:
+  w_err: 1.0
+  w_jerk: 0.01
+  w_eng: 0.001
+algo: PPO
+n_envs: 1
+total_steps: 500000
+lr: 0.0001
+gamma: 0.99
+gae_lambda: 0.95
+batch_size: 1024
+n_epochs: 8
+clip_range: 0.12
+ent_coef: 0.0
+vf_coef: 0.5

@@ -1,0 +1,26 @@
+env:
+  dt: 0.02
+  max_power: 60.0
+reward:
+  w_err: 1.0
+  w_jerk: 0.01
+  w_eng: 0.001
+algorithm:
+  name: PPO
+  policy: MlpPolicy
+ppo:
+  learning_rate: 0.0001
+  gamma: 0.99
+  gae_lambda: 0.95
+  ent_coef: 0.0
+  vf_coef: 0.5
+  clip_range: 0.12
+  clip_range_vf: 0.12
+  max_grad_norm: 0.5
+  n_epochs: 8
+sampling:
+  n_envs: 1
+  batch_size: 1024
+train:
+  total_timesteps: 500000
+  seed: 42
