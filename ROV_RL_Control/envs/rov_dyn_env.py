@@ -2,44 +2,76 @@
 # envs/rov_dyn_env.py
 
 """
-Gym 环境：基于 HybridDynamicsModel 的加速度／位置／姿态控制任务
+Gym 环境：基于 HybridDynamicsModel 的加速度／位置／姿态控制任务。
 
-- Observation (36 维)：
+Observation (37 维):
     [ pos(3), vel(3), quat(4), angv(3),
       target_pos(3), target_quat(4),
-      imu_accel(6), jerk(3),
-      last_action(8) ]
+      imu_accel(6), jerk(3), last_action(8) ]
 
-- Action (8 维)：推力功率 ∈ [0, max_power]
+Action (8 维)：推力功率 ∈ [0, max_power]
 
-- Reward：
-    r = - k_pos  * ||pos - target_pos||        # 位置误差惩罚
-        - k_att  * ||angle_dist(quat, target_quat)|| # 姿态误差惩罚
-        - k_vel  * ||vel||                     # 速度惩罚（抑制振荡）
-        - k_jerk * ||jerk||                    # 角加速度变化惩罚（运动平滑）
-        - k_acc  * ||accel_f - target_accel||  # 加速度跟踪误差惩罚
-        - k_eng  * ∑(action^2)                  # 能耗惩罚
-        + k_succ * (pos_error < pos_tol)        # 成功到达目标位置奖励
+Reward:
+    r = - k_pos  * ||pos - target_pos||
+        - k_att  * ||angle_dist(quat, target_quat)||
+        - k_vel  * ||vel||
+        - k_jerk * ||jerk||
+        - k_acc  * ||accel_f - target_accel||
+        - k_eng  * ∑(action^2)
+        + k_succ * 1{pos_error < pos_tol}
 """
 
 import gymnasium as gym
 import numpy as np
 import torch
+import logging
 from collections import deque
 from pathlib import Path
+from typing import Any, Dict, Tuple
 
 from utils.math_util import (
     quat_mul,
+    normalize_vec,
+    quat_from_omega,
     lowpass_filter,
+    angle_dist,
     integrate_accel,
     integrate_velocity,
-    normalize_vec,
-    quat_from_omega
+    integrate_ang_acc,
+    quat_to_rot_matrix,
+    body_to_nav_vel,
 )
 from models.lstm_dyn.loader import load_dynamics
 
+# ─── 日志配置（只写 rov_env_log.txt，不打印到终端） ───────────────────────────
+import logging
+from pathlib import Path
+
+LOG_FILE = Path.cwd() / "rov_env_log.txt"
+logger = logging.getLogger("ROVDynEnv")
+logger.setLevel(logging.INFO)
+
+# 如果之前有任何 handler，先移除
+for h in list(logger.handlers):
+    logger.removeHandler(h)
+
+# 只添加 FileHandler
+fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+fh.setLevel(logging.INFO)
+fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+fh.setFormatter(fmt)
+logger.addHandler(fh)
+
+# 重要：阻止消息传递到根 logger，否则会在终端打印
+logger.propagate = False
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 class ROVDynEnv(gym.Env):
+    """
+    ROV 动力学控制环境，使用 LSTM+HybridDynamicsModel 预测加速度，基于参考轨迹进行跟踪。
+    """
+
     metadata = {"render_modes": []}
 
     def __init__(
@@ -48,137 +80,136 @@ class ROVDynEnv(gym.Env):
         max_power: float = 60.0,
         device: str = "cpu",
         window_size: int = 9,
-        # —— 奖励系数 —— #
-        k_pos: float = 1.0,        # 位置误差惩罚系数
-        k_att: float = 0.5,        # 姿态误差惩罚系数
-        k_vel: float = 0.1,        # 速度惩罚系数
-        k_jerk: float = 0.01,      # 角加速度变化惩罚系数
-        k_acc: float = 1.0,        # 加速度跟踪误差惩罚系数
-        k_eng: float = 0.001,      # 能耗惩罚系数
-        k_succ: float = 5.0,       # 成功到达目标奖励
-        pos_tol: float = 0.1,      # 目标位置容忍距离 (m)
+        # —— 奖励权重 —— #
+        k_pos: float = 0.0,
+        k_att: float = 0.00,
+        k_vel: float = 0.01,
+        k_jerk: float = 0.01,
+        k_acc: float = 0.1,
+        k_eng: float = 0.1,
+        k_succ: float = 5.0,
+        pos_tol: float = 0.1,
         accel_filter_alpha: float = 0.5,
-        traj_name: str = "hover",  # 指定要加载哪条参考轨迹（对应 data/ref_trajs/{traj_name}_traj.npy / accel_{traj_name}.npy）
+        traj_name: str = "hover",
     ):
         """
-        参数说明：
-          - dt, max_power, device, window_size: 同之前含义
+        初始化 ROV 控制环境
+
+        参数:
+          - dt: 时间步长 (s)
+          - max_power: 最大推进器功率 (W)
+          - device: "cpu" 或 "cuda"
+          - window_size: LSTM 输入序列长度
           - k_pos, k_att, k_vel, k_jerk, k_acc, k_eng, k_succ, pos_tol: 奖励权重
           - accel_filter_alpha: 加速度低通滤波系数
-          - traj_name: 参考轨迹的文件名前缀，比如 "hover"、"circle" 等
+          - traj_name: 参考轨迹文件名前缀，例如 "hover", "circle" 等
         """
         super().__init__()
 
         # —— 基本参数 —— #
-        self.dt         = dt
-        self.max_power  = max_power
-        self.device     = device
-        self.window     = window_size
-        self.alpha      = accel_filter_alpha
+        self.dt = dt
+        self.max_power = max_power
+        self.device = device
+        self.window = window_size
+        self.alpha = accel_filter_alpha
 
         # —— 奖励权重 —— #
-        self.k_pos   = k_pos
-        self.k_att   = k_att
-        self.k_vel   = k_vel
-        self.k_jerk  = k_jerk
-        self.k_acc   = k_acc
-        self.k_eng   = k_eng
-        self.k_succ  = k_succ
+        self.k_pos = k_pos
+        self.k_att = k_att
+        self.k_vel = k_vel
+        self.k_jerk = k_jerk
+        self.k_acc = k_acc
+        self.k_eng = k_eng
+        self.k_succ = k_succ
         self.pos_tol = pos_tol
 
-        # —— 加载混合动力学模型 (HybridDynamicsModel) —— #
-        self.model, _ = load_dynamics(self.device)
-        self.model.eval()
+        logger.info(
+            f"[INIT] dt={dt}, max_power={max_power}, device={device}, window_size={window_size}, "
+            f"accel_filter_alpha={accel_filter_alpha}\n"
+            f"       k_pos={k_pos}, k_att={k_att}, k_vel={k_vel}, k_jerk={k_jerk}, "
+            f"k_acc={k_acc}, k_eng={k_eng}, k_succ={k_succ}, pos_tol={pos_tol}\n"
+            f"       traj_name={traj_name}"
+        )
 
-        # —— 动作空间 & 观测空间 —— #
+        # —— 定义动作空间与观测空间 —— #
         self.action_space = gym.spaces.Box(
             low=0.0, high=self.max_power, shape=(8,), dtype=np.float32
         )
-        # 观测：36 维
-        # [pos(3), vel(3), quat(4), angv(3),
-        #  target_pos(3), target_quat(4),
-        #  imu_accel(6), jerk(3),
-        #  last_action(8)]
-        obs_high = np.full(36, np.inf, dtype=np.float32)
+        obs_high = np.full(37, np.inf, dtype=np.float32)
         self.observation_space = gym.spaces.Box(
             low=-obs_high, high=obs_high, dtype=np.float32
         )
 
-        # —— 环境内部状态 —— #
-        self.pos   = np.zeros(3, dtype=np.float32)    # 位置
-        self.vel   = np.zeros(3, dtype=np.float32)    # 线速度
-        self.quat  = np.array([0, 0, 0, 1], dtype=np.float32)  # 单位四元数
-        self.angv  = np.zeros(3, dtype=np.float32)    # 角速度
+        # —— 初始化内部状态 缓冲区与模型—— #
+        self._init_state_buffers()
+        self._init_dynamics_model()
 
-        # —— 目标状态 —— #
-        self.target_pos    = np.zeros(3, dtype=np.float32)
-        self.target_quat   = np.array([0, 0, 0, 1], dtype=np.float32)
-        # 当前要跟踪的“真实”加速度
-        self.target_accel  = None  # 会在 reset() 里赋值为形状 (T,6) 的数组
+        # —— 加载参考轨迹与加速度 —— #
+        self._load_reference(traj_name)
 
-        # —— 历史缓冲区 —— #
-        self.acc_buf       = deque(maxlen=2)   # 原始加速度缓冲 (用来做低通滤波)
-        self.jerk_buf      = deque(maxlen=1)   # 仅存储上一帧的角加加速度差分
-        self.pw_buf        = deque(maxlen=window_size)  # 最近 window_size 帧的推力功率
-        self.imu_buf       = deque(maxlen=window_size)  # 最近 window_size 帧的“滤波后”加速度
-        self.last_actions  = deque(maxlen=1)            # 仅存储上一帧动作
+        # —— 初始化环境变量 —— #
+        self._reset_internal_state()
 
-        # —— 用于跟踪当前时刻索引 —— #
-        self.step_count    = 0
+    def _init_state_buffers(self) -> None:
+        """
+        初始化用于动力学积分与滤波的缓冲区：
+          - acc_buf: 最近 2 帧原始加速度
+          - ang_acc_buf: 最近 2 帧角加速度（用于计算 jerk）
+          - imu_buf: 最近 window 帧滤波后加速度
+          - pw_buf: 最近 window 帧推力功率
+          - last_actions: 存储上一帧动作
+        """
+        self.acc_buf = deque(maxlen=2)
+        self.ang_acc_buf = deque(maxlen=2)
+        self.imu_buf = deque(maxlen=self.window)
+        self.pw_buf = deque(maxlen=self.window)
+        self.last_actions = deque(maxlen=1)
 
-        # —— 参考数据路径 & 加载 —— #
-        data_root = Path(__file__).resolve().parent.parent / "data" / "ref_trajs"
-        traj_path  = data_root / f"{traj_name}_traj.npy"
-        accel_path = data_root / f"accel_{traj_name}.npy"
+    def _init_dynamics_model(self) -> None:
+        """
+        加载混合动力学模型 (HybridDynamicsModel)。模型用于根据历史推力和历史加速度预测加速度。
+        """
+        self.model, _ = load_dynamics(self.device)
+        self.model.eval()
+        logger.info("[MODEL] HybridDynamicsModel loaded and set to eval mode.")
 
-        # 1) 加载轨迹文件 (假设格式：每行 3(pos) + 4(quat) + 6(额外信息可忽略))
-        #    这里我们只关心 pos(0:3) 和 quat(3:7)，如果轨迹 npy 里多存了姿态
-        raw_traj = np.load(traj_path)  # e.g. shape (T, 13)
-        # 将前 3 列视作位置，3:7 列视作四元数
-        self.ref_pos_traj   = raw_traj[:, 0:3].astype(np.float32)  # shape (T,3)
-        self.ref_quat_traj  = raw_traj[:, 3:7].astype(np.float32)  # shape (T,4)
+    def _load_reference(self, traj_name: str) -> None:
+        """
+        加载 data/ref_trajs/{traj_name}_traj.npy 与 accel_{traj_name}.npy，
+        并提取 pos、quat、accel 序列。
+        """
+        base_dir = Path(__file__).resolve().parent.parent / "data" / "ref_trajs"
+        traj_path = base_dir / f"{traj_name}_traj.npy"
+        accel_path = base_dir / f"accel_{traj_name}.npy"
 
-        # 2) 加载参考加速度 (shape (T,6))：前 3 是线加速度，后 3 是角加速度
-        self.ref_accel_traj = np.load(accel_path).astype(np.float32)  # shape (T,6)
-
-        # 3) 记录轨迹长度
+        raw_traj = np.load(traj_path)  # (T, 13)
+        self.ref_pos_traj = raw_traj[:, 0:3].astype(np.float32)   # (T, 3)
+        self.ref_quat_traj = raw_traj[:, 3:7].astype(np.float32)  # (T, 4)
+        self.ref_accel_traj = np.load(accel_path).astype(np.float32)  # (T, 6)
         self.max_steps = self.ref_pos_traj.shape[0]
 
+        logger.info(f"[DATA] Loaded trajectory '{traj_name}' ({self.max_steps} steps)")
 
-    def reset(self, *, seed=None, options=None):
+    def _reset_internal_state(self) -> None:
         """
-        重置环境：
-          - pos/quart/yaw 随机初始化
-          - 其余状态置零
-          - step_count 置 0
-          - 各缓冲区置零并填充初始值
-          - target_* 直接赋为参考轨迹的第 0 帧
-        返回 (obs, {})，obs 维度 (36,)
+        在 reset() 或初始化时，设置内部状态与缓冲区为零，以及设定目标为轨迹首帧。
         """
-        super().reset(seed=seed)
-        rng = self.np_random
+        self.pos = np.zeros(3, dtype=np.float32)
+        self.vel = np.zeros(3, dtype=np.float32)
+        self.quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        self.angv = np.zeros(3, dtype=np.float32)
 
-        # —— 初始化位置/速度/姿态/角 speed —— #
-        self.pos[:]   = rng.uniform(-1.0, 1.0, size=3).astype(np.float32)
-        self.vel[:]   = 0.0
-        yaw0 = rng.uniform(0.0, 2*np.pi)
-        half = 0.5 * yaw0
-        s = np.sin(half)
-        self.quat[:] = np.array([0.0, 0.0, s, np.cos(half)], dtype=np.float32)
-        self.angv[:] = 0.0
-
-        # —— 清空并初始化加速度和 jerk 缓冲 —— #
+        # 加速度与角加速度缓冲
         zero_acc = np.zeros(6, dtype=np.float32)
         self.acc_buf.clear()
-        self.acc_buf.append(zero_acc.copy())
-        self.acc_buf.append(zero_acc.copy())
+        self.acc_buf.extend([zero_acc.copy(), zero_acc.copy()])
 
-        zero_jerk = np.zeros(3, dtype=np.float32)
-        self.jerk_buf.clear()
-        self.jerk_buf.append(zero_jerk.copy())
+        zero_ang_acc = np.zeros(3, dtype=np.float32)
+        self.ang_acc_buf.clear()
+        self.ang_acc_buf.extend([zero_ang_acc.copy(), zero_ang_acc.copy()])
 
-        # —— 清空并初始化推力与滤波后加速度缓冲 —— #
-        zero_pw  = np.zeros(8, dtype=np.float32)
+        # IMU 与推力缓冲
+        zero_pw = np.zeros(8, dtype=np.float32)
         zero_imu = np.zeros(6, dtype=np.float32)
         self.pw_buf.clear()
         self.imu_buf.clear()
@@ -186,166 +217,235 @@ class ROVDynEnv(gym.Env):
             self.pw_buf.append(zero_pw.copy())
             self.imu_buf.append(zero_imu.copy())
 
-        # —— 清空并初始化 last_actions —— #
+        # last_actions
         self.last_actions.clear()
         self.last_actions.append(zero_pw.copy())
 
-        # —— 计时器归零 —— #
+        # 上一步 jerk（用于 observation）
+        self.last_jerk = np.zeros(3, dtype=np.float32)
+
+        # 步数计数器
         self.step_count = 0
 
-        # —— 设定当前目标为第 0 帧 —— #
-        self.target_pos   = self.ref_pos_traj[0].copy()
-        self.target_quat  = self.ref_quat_traj[0].copy()
+        # 目标状态设为轨迹首帧
+        self.target_pos = self.ref_pos_traj[0].copy()
+        self.target_quat = self.ref_quat_traj[0].copy()
         self.target_accel = self.ref_accel_traj[0].copy()
 
-        # —— 返回初始观测 —— #
+    def reset(self, *, seed: int = None, options: Any = None) -> Tuple[np.ndarray, Dict]:
+        """
+        重置环境:
+          - 随机初始化 pos、quat（随机 yaw）、vel、angv 置零
+          - 清空并填充缓冲区
+          - step_count 置 0
+          - 目标设为参考轨迹第 0 帧
+
+        返回:
+          obs (37 维)、空 info dict
+        """
+        super().reset(seed=seed)
+        rng = self.np_random
+
+        # 随机初始化位置和姿态（随机 yaw）
+        self.pos[:] = rng.uniform(-1.0, 1.0, size=3).astype(np.float32)
+        self.vel[:] = 0.0
+        yaw0 = rng.uniform(0.0, 2 * np.pi)
+        half = 0.5 * yaw0
+        s = np.sin(half)
+        self.quat[:] = np.array([0.0, 0.0, s, np.cos(half)], dtype=np.float32)
+        self.angv[:] = 0.0
+
+        # 清空并初始化缓冲
+        self._reset_internal_state()
+
+        logger.info(
+            f"[RESET] pos={self.pos.tolist()}, quat={self.quat.tolist()}, "
+            f"target_pos={self.target_pos.tolist()}, target_quat={self.target_quat.tolist()}"
+        )
         return self._get_obs(), {}
 
-
-    def step(self, action):
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
-        执行一步：
-          1) Clip & 把动作记入 pw_buf、last_actions
-          2) 用最近 window 帧的 pw_buf/imu_buf 做 LSTM 输入，预测当前加速度
-          3) 去除重力 (可选，由模型本身决定)
-          4) 原始加速度入队，用 lowpass_filter 得到 accel_f (6 维)
-          5) 计算 jerk = accel_f[3:] - 上一帧 filt_seq[-2,3:]
-          6) 将线性加速度积分 -> 更新 vel, pos
-          7) 将角加速度积分 -> 更新 angv, quat
-          8) 奖励 = - k_pos * ||pos - target_pos|| 
-                    - k_att * att_error 
-                    - k_vel * ||vel||
-                    - k_jerk * ||jerk||
-                    - k_acc  * ||accel_f - target_accel||
-                    - k_eng  * ||action||^2
-                  + k_succ if pos_error < pos_tol
-          9) 更新 imu_buf, step_count, 并更新 target_* 到下一帧
-        返回 obs (36 维)、reward、done=False、False、info
+        执行一步更新:
+          1) Clip 动作，并存入 pw_buf, last_actions
+          2) LSTM 模型预测原始加速度
+          3) 去除重力分量 (z 方向减 9.81)
+          4) 低通滤波得到滤波后加速度 accel_f
+          5) 计算角加速度差分 jerk, 更新 ang_acc_buf, last_jerk
+          6) 线加速度欧拉积分 → 更新 vel, pos (并 clamp)
+          7) 角加速度欧拉积分 → 更新 angv, quat (并 clamp)
+          8) 计算 reward 与 info
+          9) 更新 imu_buf, step_count, 目标状态到下一帧
+          10) 每 500 步写一条日志（预测加速度、速度、位置、目标、各项误差、reward、control_input）
+          11) 返回 (obs, reward, done=False, truncated=False, info)
         """
-        # —(1) Clip & 记录动作—#
+        # (1) Clip & 记录推力动作
         act = np.clip(action, 0.0, self.max_power).astype(np.float32)
         self.pw_buf.append(act)
         self.last_actions.append(act.copy())
 
-        # —(2) LSTM 推理，预测原始加速度—#
-        pw_seq  = torch.tensor(
-            np.stack(self.pw_buf)[None, ...],  # (1, window, 8)
-            dtype=torch.float32, device=self.device
-        )
-        imu_seq = torch.tensor(
-            np.stack(self.imu_buf)[None, ...],  # (1, window, 6)
-            dtype=torch.float32, device=self.device
-        )
-        with torch.no_grad():
-            accel_t = self.model(pw_seq, imu_seq)  # (1,6)
-        accel = accel_t[0].cpu().numpy().astype(np.float32)  # (6,)
+        # (2) LSTM 推理预测原始加速度
+        accel_pred = self._predict_accel()
 
-        # —(3) 如有需要可手动去除重力，例如 accel[2] -= 9.81 ——#
-        #    本例中假设模型输出已剔除重力，或者不需要显式剔除
+        # (3) 去除重力分量（假设 z 方向需减去 9.81）
+        accel_pred[2] -= 9.81
 
-        # —(4) 低通滤波——#
-        self.acc_buf.append(accel)
-        raw_seq  = np.vstack(self.acc_buf)        # (2,6)
-        filt_seq = lowpass_filter(raw_seq, self.alpha)  # (2,6)
-        accel_f  = filt_seq[-1].astype(np.float32)      # (6,)
+        # (4) 加速度低通滤波
+        accel_f = self._filter_accel(accel_pred)
 
-        # —(5) 计算 jerk——#
-        jerk = accel_f[3:] - filt_seq[-2, 3:]  # 3 维
-        jerk = jerk.astype(np.float32)
-        self.jerk_buf.append(jerk.copy())
+        # (5) 计算角加速度差分 (jerk) 并更新缓冲
+        curr_ang_acc = accel_f[3:].astype(np.float32)
+        prev_ang_acc = self.ang_acc_buf[-1]
+        self.ang_acc_buf.append(curr_ang_acc.copy())
+        jerk = (curr_ang_acc - prev_ang_acc).astype(np.float32)
+        self.last_jerk = jerk.copy()
 
-        # —(6) 线加速度积分 → 更新 vel, pos ——#
-        vel_seq = integrate_accel(filt_seq[:, :3], self.dt)  # shape (2,3)
-        self.vel = vel_seq[-1].astype(np.float32)
-        pos_seq = integrate_velocity(
-            np.vstack([np.zeros(3, dtype=np.float32), vel_seq]), self.dt
-        )  # shape (2,3)
-        self.pos = pos_seq[-1].astype(np.float32)
+        # (6) 线加速度欧拉积分 → 更新 vel (m/s), pos (m)
+        lin_acc = accel_f[:3]
+        new_vel = (self.vel + lin_acc * self.dt).astype(np.float32)
+        # clamp 线速度到 [-3, +3] m/s
+        self.vel = np.clip(new_vel, -3.0, 3.0).astype(np.float32)
+        self.pos = (self.pos + self.vel * self.dt).astype(np.float32)
 
-        # —(7) 角加速度积分 → 更新 angv, quat ——#
-        self.angv += accel_f[3:] * self.dt  # (3,)
-        dq = quat_from_omega(self.angv, self.dt)  # (4,) 四元数增量
-        new_quat = quat_mul(self.quat, dq)        # 四元数乘法
-        new_quat = normalize_vec(new_quat)        # 归一化
-        self.quat = new_quat.astype(np.float32)
+        # (7) 角加速度欧拉积分 → 更新 angv (rad/s), quat
+        ang_acc = accel_f[3:]
+        new_angv = (self.angv + ang_acc * self.dt).astype(np.float32)
+        # clamp 角速度到 [-ω_max, +ω_max]，ω_max = 50°/s ≈ 0.87266 rad/s
+        omega_max = 50.0 * np.pi / 180.0
+        self.angv = np.clip(new_angv, -omega_max, omega_max).astype(np.float32)
+        dq = quat_from_omega(self.angv, self.dt)
+        quat_updated = quat_mul(self.quat, dq)
+        self.quat = normalize_vec(quat_updated).astype(np.float32)
 
-        # —(8) 计算各类误差——#
-        # 位置误差
-        pos_error = float(np.linalg.norm(self.pos - self.target_pos))
-        # 姿态误差（四元数）: att_error = arccos(2*(q·q_target)^2 - 1)
-        dot_q = float(np.dot(self.quat, self.target_quat))
-        dot_q = np.clip(dot_q, -1.0, 1.0)
-        att_error = float(np.arccos(2 * dot_q**2 - 1))
+        # (8) 计算 reward 与 info
+        reward, info = self._compute_reward(act, accel_f, jerk)
 
-        # 速度惩罚
-        vel_norm = float(np.linalg.norm(self.vel))
-        # jerk 惩罚
-        jerk_norm = float(np.linalg.norm(jerk))
-        # 能耗惩罚
-        eng_pen = float(np.dot(act, act))
-
-        # 加速度跟踪误差：||accel_f - target_accel||
-        acc_error = float(np.linalg.norm(accel_f - self.target_accel))
-
-        # 成功到达奖励（仅末状态判定）
-        success_bonus = float(self.k_succ if pos_error < self.pos_tol else 0.0)
-
-        # 汇总 reward
-        reward = (
-            - self.k_pos   * pos_error
-            - self.k_att   * att_error
-            - self.k_vel   * vel_norm
-            - self.k_jerk  * jerk_norm
-            - self.k_acc   * acc_error
-            - self.k_eng   * eng_pen
-            + success_bonus
-        )
-
-        # —(9) 更新历史缓冲 & 步数 & 下一帧目标——#
+        # (9) 更新 IMU 缓冲、步数计数、目标状态
         self.imu_buf.append(accel_f.copy())
         self.step_count += 1
-
-        # 如果尚未到达参考轨迹末尾，就把 target_* 更新到下一帧，否则保持最后一帧
         idx = min(self.step_count, self.max_steps - 1)
-        self.target_pos   = self.ref_pos_traj[idx].copy()
-        self.target_quat  = self.ref_quat_traj[idx].copy()
+        self.target_pos = self.ref_pos_traj[idx].copy()
+        self.target_quat = self.ref_quat_traj[idx].copy()
         self.target_accel = self.ref_accel_traj[idx].copy()
 
-        # 返回 obs, reward, done, truncated, info
-        info = {
-            "pos":         self.pos.copy(),
-            "vel":         self.vel.copy(),
-            "quat":        self.quat.copy(),
-            "angv":        self.angv.copy(),
-            "accel":       accel_f.copy(),
-            "jerk":        jerk.copy(),
-            "target_pos":  self.target_pos.copy(),
-            "target_quat": self.target_quat.copy(),
-            "action":      act.copy(),
-            "pos_error":   pos_error,
-            "att_error":   att_error,
-            "acc_error":   acc_error,
-        }
-        done = False  # 此处不提前结束
-        return self._get_obs(), float(reward), done, False, info
+        # (10) 每 500 步写一条详细日志
+        if self.step_count % 500 == 0:
+            pos_err = np.linalg.norm(self.pos - self.target_pos)
+            att_err = angle_dist(self.quat, self.target_quat)
+            vel_norm = np.linalg.norm(self.vel)
+            acc_err = np.linalg.norm(accel_f - self.target_accel)
+            eng_pen = np.dot(act, act)
+            jerk_norm = np.linalg.norm(jerk)
 
-    def _get_obs(self):
+            logger.info(
+                f"[STEP {self.step_count}] "
+                f"action={act.tolist()}, accel_pred={accel_pred.tolist()}, accel_f={accel_f.tolist()},\n"
+                f"           vel={self.vel.tolist()} (||vel||={vel_norm:.2f}), pos={self.pos.tolist()} (err={pos_err:.2f}),\n"
+                f"           quat={self.quat.tolist()}, target_pos={self.target_pos.tolist()}, target_quat={self.target_quat.tolist()} (att_err={att_err:.2f}),\n"
+                f"           acc_err={acc_err:.2f}, eng_pen={eng_pen:.2f}, jerk_pen={jerk_norm:.2f}, reward={reward:.2f}"
+            )
+
+        # (11) 返回 (obs, reward, done, truncated, info)
+        done = False
+        truncated = False
+        return self._get_obs(), float(reward), done, truncated, info
+
+    def _predict_accel(self) -> np.ndarray:
         """
-        构造 36 维观测： 
-          [ pos(3), vel(3),
-            quat(4), angv(3),
+        使用 LSTM 模型 (HybridDynamicsModel) 根据最近 window 帧的 pw_buf 和 imu_buf
+        预测当前原始加速度 (6 维：前三为线加速度，后三为角加速度)，返回 shape (6,) np.float32。
+        """
+        pw_seq = torch.tensor(
+            np.stack(self.pw_buf)[None, ...],  # shape (1, window, 8)
+            dtype=torch.float32,
+            device=self.device,
+        )
+        imu_seq = torch.tensor(
+            np.stack(self.imu_buf)[None, ...],  # shape (1, window, 6)
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.no_grad():
+            accel_t = self.model(pw_seq, imu_seq)  # shape (1, 6)
+        return accel_t[0].cpu().numpy().astype(np.float32)
+
+    def _filter_accel(self, raw_accel: np.ndarray) -> np.ndarray:
+        """
+        对原始加速度 raw_accel (6,) 做低通滤波，返回滤波后 accel_f (6,)。
+        """
+        self.acc_buf.append(raw_accel)
+        seq = np.vstack(self.acc_buf)  # shape (2, 6)
+        filt_seq = lowpass_filter(seq, self.alpha)  # shape (2, 6)
+        return filt_seq[-1].astype(np.float32)
+
+    def _compute_reward(
+        self, action: np.ndarray, accel_f: np.ndarray, jerk: np.ndarray
+    ) -> Tuple[float, Dict]:
+        """
+        计算本步的 reward，并返回 (reward, info)。
+        info 包含位姿、速度、加速度、jerk、目标、动作，以及各类误差变量。
+        """
+        pos_err = float(np.linalg.norm(self.pos - self.target_pos))
+        att_err = angle_dist(self.quat, self.target_quat)
+        vel_norm = float(np.linalg.norm(self.vel))
+        jerk_norm = float(np.linalg.norm(jerk))
+        eng_pen = float(np.dot(action, action))
+        acc_err = float(np.linalg.norm(accel_f - self.target_accel))
+        succ_bonus = float(self.k_succ if pos_err < self.pos_tol else 0.0)
+
+        reward = (
+            - self.k_pos * pos_err
+            - self.k_att * att_err
+            - self.k_vel * vel_norm
+            - self.k_jerk * jerk_norm
+            - self.k_acc * acc_err
+            - self.k_eng * eng_pen
+            + succ_bonus
+        )
+
+        # 简要日志（每 100 步）
+        if self.step_count % 100 == 0:
+            logger.info(
+                f"[STEP {self.step_count}] "
+                f"pos_err={pos_err:.2f}, att_err={att_err:.2f}, vel={vel_norm:.2f}, "
+                f"jerk_pen={self.k_jerk * jerk_norm:.2f}, acc_pen={self.k_acc * acc_err:.2f}, "
+                f"eng_pen={self.k_eng * eng_pen:.2f} -> reward={reward:.2f}"
+            )
+
+        info: Dict[str, Any] = {
+            "pos": self.pos.copy(),
+            "vel": self.vel.copy(),
+            "quat": self.quat.copy(),
+            "angv": self.angv.copy(),
+            "accel": accel_f.copy(),
+            "jerk": jerk.copy(),
+            "target_pos": self.target_pos.copy(),
+            "target_quat": self.target_quat.copy(),
+            "action": action.copy(),
+            "pos_error": pos_err,
+            "att_error": att_err,
+            "acc_error": acc_err,
+        }
+        return reward, info
+
+    def _get_obs(self) -> np.ndarray:
+        """
+        构造 37 维观测向量：
+          [ pos(3), vel(3), quat(4), angv(3),
             target_pos(3), target_quat(4),
-            imu_accel(6), jerk(3),
-            last_action(8) ]
+            imu_accel(6), jerk(3), last_action(8) ]
         """
-        return np.concatenate([
-            self.pos,                       # 3
-            self.vel,                       # 3
-            self.quat,                      # 4
-            self.angv,                      # 3
-            self.target_pos,                # 3
-            self.target_quat,               # 4
-            self.imu_buf[-1],               # 6 (滤波后加速度)
-            self.jerk_buf[-1],              # 3 (角加速度差分)
-            self.last_actions[-1]           # 8 (上一帧动作)
-        ], axis=0).astype(np.float32)
+        return np.concatenate(
+            [
+                self.pos,                  # 3
+                self.vel,                  # 3
+                self.quat,                 # 4
+                self.angv,                 # 3
+                self.target_pos,           # 3
+                self.target_quat,          # 4
+                self.imu_buf[-1],          # 6
+                self.last_jerk,            # 3
+                self.last_actions[-1],     # 8
+            ],
+            axis=0,
+        ).astype(np.float32)

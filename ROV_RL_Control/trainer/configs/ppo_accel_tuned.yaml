@@ -1,14 +1,16 @@
 env:
+  traj_name: hover
   dt: 0.02
-  max_power: 60.0
+  max_power: 160.0
   window_size: 9
   accel_filter_alpha: 0.5
 reward:
-  k_pos: 1.0
-  k_att: 0.5
+  k_pos: 0.0
+  k_att: 0.001
   k_vel: 0.1
   k_jerk: 0.01
   k_eng: 0.001
+  k_acc: 0.1
   k_succ: 5.0
   pos_tol: 0.1
 sampling:
