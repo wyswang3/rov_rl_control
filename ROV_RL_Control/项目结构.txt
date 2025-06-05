@@ -1,39 +1,41 @@
-rov_rl_control/
-├─ README.md
-├─ docs/
-├─ envs/
-│  ├─ rov_dyn_env.py
-│  └─ vector/
-│      └─ make_vec_env.py
-├─ models/
-│  ├─ policy_net.py
-│  └─ lstm_dyn/
-│      ├─ loader.py
-│      └─ model_hybrid_full.pt
-├─ trainer/
-│  ├─ configs/
-│  │   └─ generate_config.py
-│  ├─ train_ppo.py
-│  └─ train_sac.py
-├─ utils/
-│  └─ math_util.py
-├─ scripts/
-│  ├─ run_train.sh
-│  └─ run_eval.sh
-├─ tests/
-│  └─ test_env.py
-├─ data/
-└─ requirements-train.txt
+rov_rl_control/                     # 项目根目录
+├─ .gitignore                       # 忽略配置，建议包含 .idea/、__pycache__/ 等
+├─ README.md                        # 项目总说明：目的、目录结构、快速上手
+├─ requirements-train.txt           # 训练/运行所需 Python 库版本
 
-git add .
-git commit -m "cpu运行测试通过"
-git push
-pip freeze > requirements-train.txt
-# 你此时在 main 上做了修改，甚至还没 commit
-git checkout -b accel-ctrl   # 会自动把当前修改带到新分支
-git checkout  accel-ctrl
-git add .
-git commit -m "调整了状态空间 "
-git push -u origin accel-ctrl
+├─ env/                             # 自定义强化学习环境
+│   ├─ __init__.py
+│   ├─ rov_env.py                   # 继承 gymnasium.Env，定义 Observation/Action/step/reset
+│   ├─ utils_env.py                 # 辅助函数：推力分配矩阵、动力学模型接口等
+│   └─ README.md                    # 说明 env 模块职责与接口
 
-python -m trainer.train_ppo -c trainer/configs/ppo_accel_tuned.yaml
+├─ agents/                          # 各种 RL 算法实现
+│   ├─ __init__.py
+│   ├─ sac_agent.py                 # SAC 算法：网络结构、Policy/Critic、训练/更新逻辑
+│   ├─ td3_agent.py                 # TD3 算法：网络结构、Policy/Critic、训练/更新逻辑
+│   ├─ ddpg_agent.py                # （可选）DDPG 算法实现
+│   ├─ replay_buffer.py             # 通用 Replay Buffer
+│   ├─ network.py                   # Actor/Critic 网络定义、初始化函数
+│   └─ README.md                    # 说明 agents 模块职责、各文件功能与接口
+
+├─ training/                        # 训练脚本与配置
+│   ├─ train.py                     # 训练入口：加载配置、环境、agent，主循环
+│   ├─ config.yaml                  # 超参数示例：learning_rate、gamma、batch_size、env_name 等
+│   ├─ logger.py                    # 日志与 TensorBoard 集成（可选）
+│   └─ README.md                    # 说明如何运行训练：命令示例、日志输出路径
+
+├─ evaluation/                      # 策略评估与离线回放
+│   ├─ evaluate.py                  # 加载模型，在多种初始条件下跑多次 Episode，统计指标
+│   ├─ replay.py                    # 按帧保存/渲染轨迹：位姿、动作可视化（生成 GIF 或视频）
+│   └─ README.md                    # 说明评估流程、输出格式、可视化脚本使用方法
+
+├─ sim/                             # 简化动力学与推力分配
+│   ├─ hydro_dynamics.py            # 6-DOF 理论水动力学模型：Mν̇ + C(ν)ν + D(ν)ν + g(η) = τ
+│   ├─ thruster_allocation.py       # 8 推进器 ↔ 6-DOF 目标力/矩 τ 的映射（伪逆、二次规划）
+│   ├─ parameters.py                # ROV 参数（质量、阻尼矩阵、附加质量等）可配置
+│   └─ README.md                    # 说明简化模型假设、外部接口、如何修改参数
+
+└─ deployment/                      # 导出与部署示例
+    ├─ export_onnx.py               # 将训练好的 PyTorch 模型导出为 ONNX
+    ├─ pi_runner.cpp                # C++ 示例：在 Raspberry Pi / Pixhawk 上加载并运行 ONNX/LibTorch
+    └─ README.md                    # 说明部署流程：如何编译、依赖、硬件接口等
