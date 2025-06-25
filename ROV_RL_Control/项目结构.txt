@@ -39,3 +39,8 @@ rov_rl_control/                     # 项目根目录
     ├─ export_onnx.py               # 将训练好的 PyTorch 模型导出为 ONNX
     ├─ pi_runner.cpp                # C++ 示例：在 Raspberry Pi / Pixhawk 上加载并运行 ONNX/LibTorch
     └─ README.md                    # 说明部署流程：如何编译、依赖、硬件接口等
+git checkout feature/rl-theoretical-hydrodynamics
+git status
+git add .
+git commit -m "feat(sim): 重构 HydroDynamics & ROVEnv，添加四元数支持和路径跟踪奖励"
+git push origin feature/rl-theoretical-hydrodynamics
