@@ -44,3 +44,9 @@ git status
 git add .
 git commit -m "feat(sim): 重构 HydroDynamics & ROVEnv，添加四元数支持和路径跟踪奖励"
 git push origin feature/rl-theoretical-hydrodynamics
+conda deactivate
+conda activate rov_rl_env
+# 把当前目录加入 Python 模块搜索路径
+export PYTHONPATH=$PWD
+pip freeze > requirements-train.txt
+
