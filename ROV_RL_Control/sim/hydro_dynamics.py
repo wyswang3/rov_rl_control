@@ -1,85 +1,113 @@
-# sim/hydro_dynamics.py
-"""
-ROV 六自由度刚体水动力学模型 (基于四元数)
-动力学方程: M * dot(v) + C(v)*v + D(v)*v + g(eta) = tau
-state = [pos(3), quat(4), v(3), omega(3)]
-其中 quat = [qw, qx, qy, qz]
-"""
 import numpy as np
 from sim.parameters import ROVParameters
 
+
 class HydroDynamics:
+    """
+    6-DOF rigid-body hydrodynamics with quaternion representation.
+    Dynamics: M ν̇ + C(ν) ν + D(ν) ν + g(η) = τ
+    State vector: [pos(3), quat(4), v(3), ω(3)]
+    """
     def __init__(self, params: ROVParameters = None):
-        # 初始化物理参数
         self.params = params or ROVParameters()
-        self.M_inv = self.params.M_inv         # 6×6 质量矩阵逆
-        self.C = None  # 可自定义Coriolis项
-        self.D = None  # 可自定义阻尼项
-        self.dt = self.params.dt
+        # Inverse mass-inertia matrix (6×6)
+        self.M_inv: np.ndarray = self.params.M_inv.astype(np.float64)
+        # Optional Coriolis and damping callbacks
+        self.C_func = getattr(self.params, 'C_func', None)
+        self.D_func = getattr(self.params, 'D_func', None)
+        # Precompute gravity and buoyancy effect
+        self.g_vec: np.ndarray = self._compute_gravity_buoyancy()
+        # Time step
+        self.dt: float = float(self.params.dt)
 
-    def quaternion_to_rotation(self, q: np.ndarray) -> np.ndarray:
-        # 将四元数转为旋转矩阵
-        qw, qx, qy, qz = q
-        # 归一化
-        norm = np.linalg.norm(q)
-        qw, qx, qy, qz = q / norm
-        # 旋转矩阵计算
-        R = np.array([
-            [1 - 2*(qy**2 + qz**2),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
-            [    2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2),     2*(qy*qz - qx*qw)],
-            [    2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)]
-        ], dtype=np.float32)
-        return R
+    def _compute_gravity_buoyancy(self) -> np.ndarray:
+        """
+        Compute gravity minus buoyancy generalized force vector.
+        Returns a 6D vector: [0,0, m*g - B, 0,0,0].
+        """
+        # Mass fallback
+        m = getattr(self.params, 'mass', None)
+        if m is None:
+            m = getattr(self.params, 'm', None)
+        if m is None:
+            raise AttributeError("ROVParameters missing 'mass' or 'm'")
+        # Gravity constant
+        gravity = getattr(self.params, 'g', 9.81)
+        # Buoyancy fallback
+        B = getattr(self.params, 'buoyancy', None)
+        if B is None:
+            B = getattr(self.params, 'B', 0.0)
+        # Build vector
+        g_vec = np.zeros(6, dtype=np.float64)
+        g_vec[2] = m * gravity - B
+        return g_vec
 
-    def omega_to_quat_mat(self, omega: np.ndarray) -> np.ndarray:
-        # 构造用于四元数导数的矩阵: Omega(omega)
-        wx, wy, wz = omega
+    @staticmethod
+    def quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
+        """Convert unit quaternion to rotation matrix."""
+        qw, qx, qy, qz = (q / np.linalg.norm(q)).astype(np.float64)
         return np.array([
-            [ 0.0, -wx,  -wy,  -wz ],
-            [ wx,   0.0,  wz,  -wy ],
-            [ wy,  -wz,   0.0,  wx ],
-            [ wz,   wy,  -wx,  0.0 ]
+            [1-2*(qy**2+qz**2),   2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw),   1-2*(qx**2+qz**2), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw),   2*(qy*qz + qx*qw), 1-2*(qx**2+qy**2)]
         ], dtype=np.float32)
 
-    def acceleration(self, v_full: np.ndarray, tau: np.ndarray) -> np.ndarray:
-        # 计算6维速度加速度: v_full = [u,v,w,p,q,r]
-        # 可扩展 C(v) 和 D(v) 模型
-        # 简化：仅线性阻尼 + 重力浮力
-        g = np.zeros(6, dtype=np.float32)
-        Fz = self.params.m * self.params.g - self.params.buoyancy
-        g[2] = Fz
-        rhs = tau - g
+    @staticmethod
+    def omega_to_quat_mat(omega: np.ndarray) -> np.ndarray:
+        """Return Ω(ω) matrix for quaternion kinematics."""
+        wx, wy, wz = omega.astype(np.float64)
+        return np.array([
+            [ 0. , -wx, -wy, -wz],
+            [ wx,  0. ,  wz, -wy],
+            [ wy, -wz,  0. ,  wx],
+            [ wz,  wy, -wx,  0. ]
+        ], dtype=np.float64)
+
+    def acceleration(self, nu: np.ndarray, tau: np.ndarray) -> np.ndarray:
+        """
+        Compute generalized acceleration: ν̇ = M_inv (τ - g - Cν - Dν).
+        nu: [u,v,w,p,q,r], tau: [Fx,Fy,Fz,Mx,My,Mz]
+        """
+        rhs = tau.astype(np.float64) - self.g_vec
+        if self.C_func is not None:
+            rhs -= self.C_func(nu).dot(nu)
+        if self.D_func is not None:
+            rhs -= self.D_func(nu).dot(nu)
         return self.M_inv.dot(rhs)
 
     def deriv(self, state: np.ndarray, tau: np.ndarray) -> np.ndarray:
-        # 计算状态导数
-        pos = state[0:3]             # 位置
-        quat = state[3:7]            # 四元数
-        v_lin = state[7:10]          # 线速度
-        omega = state[10:13]         # 角速度
-        # 位置导数: dot(pos) = R(q) * v_lin
+        """
+        Compute state derivative: [pos_dot, quat_dot, v_dot, omega_dot].
+        """
+        pos = state[0:3].astype(np.float64)
+        quat = state[3:7].astype(np.float64)
+        v_lin = state[7:10].astype(np.float64)
+        omega = state[10:13].astype(np.float64)
+
+        # Kinematics
         R = self.quaternion_to_rotation(quat)
-        dot_pos = R.dot(v_lin)
-        # 四元数导数: dot(quat) = 0.5 * Omega(omega) * quat
-        Omega = self.omega_to_quat_mat(omega)
-        dot_quat = 0.5 * Omega.dot(quat)
-        # 6维加速度
-        v_full = np.concatenate([v_lin, omega])
-        dot_vfull = self.acceleration(v_full, tau)
-        # 拆分线性与角加速度
-        dot_v_lin = dot_vfull[0:3]
-        dot_omega = dot_vfull[3:6]
-        # 拼接返回 3 + 4 + 3 + 3 = 13 维导数
-        return np.concatenate([dot_pos, dot_quat, dot_v_lin, dot_omega])
+        pos_dot = R.dot(v_lin)
+        quat_dot = 0.5 * self.omega_to_quat_mat(omega).dot(quat)
+
+        # Dynamics
+        nu = np.concatenate([v_lin, omega])
+        nu_dot = self.acceleration(nu, tau)
+        v_dot = nu_dot[0:3]
+        omega_dot = nu_dot[3:6]
+
+        return np.concatenate([pos_dot, quat_dot, v_dot, omega_dot]).astype(np.float32)
 
     def integrate(self, state: np.ndarray, tau: np.ndarray) -> np.ndarray:
-        # 使用 RK4 进行数值积分
+        """
+        Integrate state forward dt using RK4 and normalize quaternion.
+        """
         h = self.dt
         k1 = self.deriv(state, tau)
         k2 = self.deriv(state + 0.5*h*k1, tau)
         k3 = self.deriv(state + 0.5*h*k2, tau)
-        k4 = self.deriv(state + h*k3, tau)
+        k4 = self.deriv(state +   h*k3, tau)
         next_state = state + (h/6.0)*(k1 + 2*k2 + 2*k3 + k4)
-        # 确保四元数归一化
-        next_state[3:7] /= np.linalg.norm(next_state[3:7])
+        # Normalize quaternion
+        q = next_state[3:7]
+        next_state[3:7] = (q / (np.linalg.norm(q) + 1e-12)).astype(np.float32)
         return next_state

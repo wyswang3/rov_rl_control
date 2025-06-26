@@ -1,5 +1,17 @@
+task: path_following
+algorithm: sac
+environment:
+  waypoints: 5
+  bounds:
+  - - -1.0
+    - -1.0
+    - -1.0
+  - - 1.0
+    - 1.0
+    - 1.0
+  tolerance: 0.1
 hyperparameters:
-  max_episodes: 500
+  max_episodes: 100
   max_steps_per_episode: 1000
   replay_buffer_size: 1000000
   batch_size: 256
@@ -8,21 +20,15 @@ hyperparameters:
   explore_noise: 0.1
   eval_interval: 20
   save_interval: 50
-  sac:
-    lr: 0.0003
-    automatic_entropy_tuning: true
-    target_entropy: -8
-    use_value_net: true
-    log_std_min: -20
-    log_std_max: 2
-  td3:
-    actor_lr: 0.0003
-    critic_lr: 0.0003
-    policy_noise: 0.2
-    noise_clip: 0.5
-    policy_freq: 2
-  ddpg:
-    actor_lr: 0.0001
-    critic_lr: 0.001
-    noise_std: 0.1
-    noise_clip: 0.2
+  lr: 0.0003
+  automatic_entropy_tuning: true
+  target_entropy: -8
+  use_value_net: true
+  log_std_min: -20
+  log_std_max: 2
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  policy_noise: 0.2
+  noise_clip: 0.2
+  policy_freq: 2
+  noise_std: 0.1
