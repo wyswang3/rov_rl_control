@@ -1,4 +1,3 @@
-# training/train.py
 #!/usr/bin/env python3
 import os
 import argparse
@@ -12,15 +11,31 @@ from agents.sac_agent import SACAgent
 from agents.td3_agent import TD3Agent
 from agents.ddpg_agent import DDPGAgent
 from training.logger import Logger
-from training.target_generator import random_pose_target, generate_trajectory
+from training.target_generator import random_pose_target, random_path
 
 
 def parse_args():
     parser = argparse.ArgumentParser("Train RL agent for ROV control")
-    parser.add_argument("--config", default="training/config.yaml", help="Path to config.yaml")
-    parser.add_argument("--seed", type=int, default=42, help="Base random seed")
-    parser.add_argument("--save-dir", default="training/checkpoints", help="Directory to save checkpoints and logs")
-    parser.add_argument("--algo", choices=["sac","td3","ddpg"], default="sac", help="RL algorithm to use")
+    parser.add_argument(
+        "--config", type=str, default="training/config.yaml",
+        help="Path to config.yaml"
+    )
+    parser.add_argument(
+        "--algo", type=str, choices=["sac", "td3", "ddpg"],
+        default="sac", help="Algorithm to use"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--save-dir", type=str, default="training/checkpoints",
+        help="Directory to save checkpoints and logs"
+    )
+    parser.add_argument(
+        "--record-interval", type=int, default=100,
+        help="Record trajectories every N episodes"
+    )
     return parser.parse_args()
 
 
@@ -38,103 +53,139 @@ def make_env(seed: int, task: str) -> ROVEnv:
     return env
 
 
-def select_agent(algo: str, state_dim: int, action_dim: int, buffer_size: int, cfg: dict):
-    mapping = {'sac': SACAgent, 'td3': TD3Agent, 'ddpg': DDPGAgent}
-    AgentCls = mapping.get(algo)
-    if AgentCls is None:
+def select_agent(algo: str, state_dim: int, action_dim: int, buffer_size: int, hyper: dict):
+    mapping = {
+        'sac': SACAgent,
+        'td3': TD3Agent,
+        'ddpg': DDPGAgent
+    }
+    Agent = mapping.get(algo)
+    if Agent is None:
         raise ValueError(f"Unsupported algorithm: {algo}")
-    return AgentCls(state_dim, action_dim, buffer_size, cfg.get('hyperparameters', {}), debug=False)
+    return Agent(state_dim, action_dim, buffer_size, hyper)
 
 
 def main():
     args = parse_args()
     cfg = load_config(args.config)
 
+    # set global seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    # prepare save directory
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     save_dir = os.path.join(args.save_dir, f"{args.algo}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
 
+    # initialize environment and agent
     task = cfg.get('task', 'pose_control')
     env = make_env(args.seed, task)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     buffer_size = cfg['hyperparameters'].get('replay_buffer_size', 1_000_000)
+    agent = select_agent(
+        args.algo, state_dim, action_dim,
+        buffer_size, cfg['hyperparameters']
+    )
 
-    agent = select_agent(args.algo, state_dim, action_dim, buffer_size, cfg)
-    agent.set_mode('train')
-
+    # logger
     logger = Logger(log_dir=os.path.join(save_dir, 'logs'))
 
+    # hyperparameters
     H = cfg['hyperparameters']
     max_eps = H.get('max_episodes', 500)
     max_steps = H.get('max_steps_per_episode', 1000)
     save_int = H.get('save_interval', 50)
-    noise = H.get('explore_noise', 0.1)
+    explore_noise = H.get('explore_noise', 0.1)
+    record_int = args.record_interval
 
-    train_rewards, train_steps = [], []
+    # storage for metrics and trajectories
+    train_rewards = []
+    train_steps = []
+    recorded = {}
 
     for ep in range(1, max_eps + 1):
         seed_i = args.seed + ep
-        # generate task-specific trajectory
+        # reset environment with target
         if task == 'pose_control':
             pos_rng = cfg['environment']['position_range']
             tp, tq = random_pose_target(tuple(map(np.array, pos_rng)), True)
-            state, _ = env.reset(seed=seed_i, target_pos=tp, target_quat=tq)
-        else:
-            # continuous trajectory for path_following
-            bounds = tuple(map(np.array, cfg['environment']['bounds']))
-            pos_traj, quat_traj = generate_trajectory(
-                mode='piecewise_linear',
-                steps=max_steps,
-                num_waypoints=cfg['environment']['waypoints'],
-                bounds=bounds,
-                seed=seed_i
+            state, _ = env.reset(
+                seed=seed_i,
+                target_pos=tp,
+                target_quat=tq
             )
-            state, _ = env.reset(seed=seed_i, path=pos_traj, path_quat=quat_traj)
+            target = {'pos': tp, 'quat': tq}
+        else:
+            wp = cfg['environment']['waypoints']
+            bnds = tuple(map(np.array, cfg['environment']['bounds']))
+            path = random_path(wp, bnds)
+            state, _ = env.reset(seed=seed_i, path=path)
+            target = {'path': path}
 
-        ep_reward, steps = 0.0, 0
-        stuck = True
+        ep_reward = 0.0
+        steps = 0
+        # prepare trajectory recording
+        if ep % record_int == 0:
+            traj_pos = []
+            traj_quat = []
 
-        for step in range(max_steps):
+        for step in range(1, max_steps + 1):
             # select action
             if args.algo == 'sac':
                 action = agent.select_action(state, evaluate=False)
             else:
-                action = agent.select_action(state, noise=noise)
+                action = agent.select_action(state, noise=explore_noise)
 
-            next_state, reward, done, trunc, _ = env.step(action)
-            # check state update
-            if not np.allclose(next_state, state, atol=1e-8):
-                stuck = False
+            next_state, reward, done, trunc, info = env.step(action)
+            ep_reward += reward
+            steps = step
 
+            # record raw state
+            if ep % record_int == 0:
+                raw = env.state.copy()
+                traj_pos.append(raw[0:3])
+                traj_quat.append(raw[3:7])
+
+            # store and update
             agent.store_transition(state, action, reward, next_state, done)
             agent.update()
-
             state = next_state
-            ep_reward += reward
-            steps = step + 1
             if done or trunc:
                 break
 
-        if stuck:
-            raise RuntimeError(f"Episode {ep}: No state change detected, abort training.")
-
+        # log metrics
         train_rewards.append(ep_reward)
         train_steps.append(steps)
         logger.log_scalar('Train/EpisodeReward', ep_reward, ep)
         print(f"Episode {ep}/{max_eps} | Reward: {ep_reward:.2f} | Steps: {steps}")
 
+        # periodic saving
         if ep % save_int == 0:
             ckpt = os.path.join(save_dir, f"{args.algo}_ep{ep}.pth")
             agent.save(ckpt)
+        # record trajectories
+        if ep % record_int == 0:
+            recorded[f"ep_{ep}"] = {
+                'positions': np.array(traj_pos, dtype=np.float32),
+                'quaternions': np.array(traj_quat, dtype=np.float32),
+                'target': target
+            }
 
-    final_ckpt = os.path.join(save_dir, f"{args.algo}_final.pth")
-    agent.save(final_ckpt)
+    # final save
+    final_path = os.path.join(save_dir, f"{args.algo}_final.pth")
+    agent.save(final_path)
+    # dump recorded trajectories
+    if recorded:
+        np.savez(
+            os.path.join(save_dir, 'recorded_trajectories.npz'),
+            **recorded
+        )
+
     env.close()
     logger.close()
+
 
 if __name__ == '__main__':
     main()

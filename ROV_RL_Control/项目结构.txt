@@ -42,7 +42,7 @@ rov_rl_control/                     # 项目根目录
 git checkout feature/rl-theoretical-hydrodynamics
 git status
 git add .
-git commit -m "feat(sim): 调整了奖励函数"
+git commit -m "feat(sim): 调整了训练流程"
 git push origin feature/rl-theoretical-hydrodynamics
 conda deactivate
 conda activate rov_rl_env
@@ -50,7 +50,7 @@ conda activate rov_rl_env
 export PYTHONPATH=$PWD
 pip freeze > requirements-train.txt
 
-python train.py \
+python training/train.py \
   --config training/config.yaml \
   --algo sac \
   --seed 123 \
@@ -59,7 +59,11 @@ python train.py \
 python training/evaluate.py \
   --config training/config.yaml \
   --algo sac \
-  --checkpoint training/checkpoints/sac_20250626_195339/sac_final.pth \
+  --checkpoint training/checkpoints/sac_20250628_165431/sac_final.pth \
   --episodes 10 \
-  --output-dir evaluation
+  --max-steps 1000 \
+  --output-dir evaluation \
+  --seed 123
+
+
 
